@@ -1,0 +1,28 @@
+name: Docker CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: docker build -t docker-training:${{ github.sha }} .
+
+      - name: Run container smoke test
+        run: |
+          docker run --rm docker-training:${{ github.sha }} echo "Container is working!"
+
+      - name: List Docker images
+        run: docker images
