@@ -9,6 +9,6 @@ RUN mvn package -DskipTests --batch-mode
 # ── Stage 2: Lightweight runtime ──────────────────────────────────────────────
 FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY --from=build /app/target/java-web-app-1.0.0.jar app.jar
+COPY --from=build /app/target/java-web-app-1.0.1.jar app.jar
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
