@@ -1,0 +1,20 @@
+services:
+  # Java backend application (NOT exposed to the outside directly)
+  java-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: java-app
+    expose:
+      - "8080"
+
+  # Nginx reverse proxy (the public entry point)
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+    depends_on:
+      - java-app
