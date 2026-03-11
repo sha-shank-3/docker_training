@@ -1,0 +1,222 @@
+name: Full-Stack CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'fullstack-app/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'fullstack-app/**'
+  workflow_dispatch:
+
+env:
+  DOCKERHUB_USERNAME: shashank391999
+
+jobs:
+  # ── Job 1: Lint & Validate ─────────────────────────────────────────────────
+  lint:
+    name: Lint Dockerfiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Python Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: fullstack-app/python-backend/Dockerfile
+          failure-threshold: warning
+
+      - name: Lint Java Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: fullstack-app/java-backend/Dockerfile
+          failure-threshold: warning
+
+      - name: Lint Nginx Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: fullstack-app/Dockerfile.nginx
+          failure-threshold: warning
+
+  # ── Job 2: Build & Test with Docker Compose ────────────────────────────────
+  build-and-test:
+    name: Build & Test Stack
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build all services
+        working-directory: fullstack-app
+        run: docker compose build
+
+      - name: Start services
+        working-directory: fullstack-app
+        run: docker compose up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for PostgreSQL..."
+          for i in $(seq 1 30); do
+            if docker exec fullstack-postgres pg_isready -U appuser -d appdb 2>/dev/null; then
+              echo "PostgreSQL is ready"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Waiting for Redis..."
+          for i in $(seq 1 15); do
+            if docker exec fullstack-redis redis-cli ping 2>/dev/null | grep -q PONG; then
+              echo "Redis is ready"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Waiting for Python backend..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:5000/api/health > /dev/null 2>&1; then
+              echo "Python backend is ready"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Waiting for Java backend..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "Java backend is ready"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Test Python Backend Health
+        run: |
+          RESPONSE=$(curl -sf http://localhost:5000/api/health)
+          echo "Python Health: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"app":"UP"'
+          echo "$RESPONSE" | grep -q '"database":"UP"'
+          echo "$RESPONSE" | grep -q '"cache":"UP"'
+
+      - name: Test Java Backend Health
+        run: |
+          RESPONSE=$(curl -sf http://localhost:8080/health)
+          echo "Java Health: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"status": "UP"'
+
+      - name: Test Nginx Proxy to Python
+        run: |
+          RESPONSE=$(curl -sf http://localhost:80/api/health)
+          echo "Nginx -> Python: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"app":"UP"'
+
+      - name: Test Nginx Proxy to Java
+        run: |
+          RESPONSE=$(curl -sf http://localhost:80/java/health)
+          echo "Nginx -> Java: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"status": "UP"'
+
+      - name: Test CRUD Operations
+        run: |
+          # Create a task
+          CREATE=$(curl -sf -X POST http://localhost:5000/api/tasks \
+            -H "Content-Type: application/json" \
+            -d '{"title":"CI Test Task"}')
+          echo "Create: $CREATE"
+          echo "$CREATE" | grep -q '"title":"CI Test Task"'
+
+          # List tasks
+          LIST=$(curl -sf http://localhost:5000/api/tasks)
+          echo "List: $LIST"
+          echo "$LIST" | grep -q '"CI Test Task"'
+
+          # Get stats
+          STATS=$(curl -sf http://localhost:5000/api/stats)
+          echo "Stats: $STATS"
+          echo "$STATS" | grep -q '"total":1'
+
+      - name: Show container logs on failure
+        if: failure()
+        working-directory: fullstack-app
+        run: docker compose logs
+
+      - name: Stop services
+        if: always()
+        working-directory: fullstack-app
+        run: docker compose down -v
+
+  # ── Job 3: Push Images to Docker Hub ───────────────────────────────────────
+  push-images:
+    name: Push to Docker Hub
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Python Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: fullstack-app/python-backend
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/python-backend:latest
+            ${{ env.DOCKERHUB_USERNAME }}/python-backend:${{ github.sha }}
+
+      - name: Build Java Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: fullstack-app/java-backend
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/java-web-app:latest
+            ${{ env.DOCKERHUB_USERNAME }}/java-web-app:${{ github.sha }}
+
+      - name: Build Nginx
+        uses: docker/build-push-action@v5
+        with:
+          context: fullstack-app
+          file: fullstack-app/Dockerfile.nginx
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/fullstack-nginx:latest
+            ${{ env.DOCKERHUB_USERNAME }}/fullstack-nginx:${{ github.sha }}
+
+  # ── Job 4: Summary ─────────────────────────────────────────────────────────
+  summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [lint, build-and-test, push-images]
+    if: always()
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 🚀 Full-Stack Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint Dockerfiles | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Test | ${{ needs.build-and-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Push to Docker Hub | ${{ needs.push-images.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Docker Hub Images" >> $GITHUB_STEP_SUMMARY
+          echo "- \`shashank391999/python-backend:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`shashank391999/java-web-app:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`shashank391999/fullstack-nginx:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🏗️ Architecture" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python Flask** — Task Manager API (PostgreSQL + Redis)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Java HTTP Server** — Dashboard (v1.0.1)" >> $GITHUB_STEP_SUMMARY
+          echo "- **PostgreSQL 16** — Database" >> $GITHUB_STEP_SUMMARY
+          echo "- **Redis 7** — Cache" >> $GITHUB_STEP_SUMMARY
+          echo "- **Nginx** — Reverse Proxy" >> $GITHUB_STEP_SUMMARY
